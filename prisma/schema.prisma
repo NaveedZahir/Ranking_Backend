@@ -1,0 +1,213 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+  
+
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum Role {
+  ADMIN
+  USER
+  VIEWER
+}
+
+enum EntityType {
+  STUDENT
+  EMPLOYEE
+  ATHLETE
+  PRODUCT
+  CUSTOM
+}
+
+enum TieBreakerStrategy {
+  DENSE               // Rank sequence: 1, 2, 2, 3
+  STANDARD_COMPETITION // Rank sequence: 1, 2, 2, 4
+}
+
+enum ImportStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+}
+
+// ==========================================
+// MODELS
+// ==========================================
+
+/// Platform Users
+model User {
+id           String           @id @default(uuid())
+  email        String           @unique
+  passwordHash String
+  name         String?
+  role         Role             @default(USER)
+  projects     RankingProject[]
+  
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@map("users")
+}
+
+/// Core Workspace for a specific domain (e.g., "Software Engineering Batch 2026")
+model RankingProject {
+  id                 String             @id @default(uuid())
+  title              String
+  description        String?
+  entityType         EntityType         @default(CUSTOM)
+  tieBreakerStrategy TieBreakerStrategy @default(DENSE)
+  
+  ownerId            String
+  owner              User               @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  criteria           RankingCriteria[]
+  participants       Participant[]
+  periods            RankingPeriod[]
+  imports            DataImport[]
+
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@index([ownerId])
+  @@map("ranking_projects")
+}
+
+/// Dynamic metrics/rules that dictate how scores are normalized and weighted
+model RankingCriteria {
+  id             String             @id @default(uuid())
+  projectId      String
+  project        RankingProject     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  name           String             // Display name (e.g., "GPA", "Sales Revenue")
+  code           String             // Excel header mapping key (e.g., "gpa", "sales_rev")
+  weight         Decimal            @db.Decimal(5, 4) // Percentage weight (e.g., 0.4000 = 40%)
+  minValue       Float              @default(0.0)
+  maxValue       Float              @default(100.0)
+  isHigherBetter Boolean            @default(true) // false if lower is better (e.g., race completion time)
+
+  scores         ParticipantScore[]
+
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  @@unique([projectId, code])
+  @@index([projectId])
+  @@map("ranking_criteria")
+}
+
+/// Time-bounded evaluation snapshot windows (e.g., "2026-Q1", "Semester 1")
+model RankingPeriod {
+  id          String          @id @default(uuid())
+  projectId   String
+  project     RankingProject  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  label       String          // e.g., "2026-Q1"
+  startDate   DateTime
+  endDate     DateTime
+  isLocked    Boolean         @default(false) // Locked periods prevent recalculation
+
+  results     RankingResult[]
+
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([projectId, label])
+  @@index([projectId])
+  @@map("ranking_periods")
+}
+
+/// The entities being ranked (Students, Employees, Athletes, etc.)
+model Participant {
+  id          String             @id @default(uuid())
+  projectId   String
+  project     RankingProject     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  externalId  String             // Unique domain ID (e.g., Student ID "CS-102", Employee Code "EMP-90")
+  name        String
+  metadata    Json?              // Flexible payload (e.g., { "department": "AI", "team": "Alpha" })
+
+  scores      ParticipantScore[]
+  results     RankingResult[]
+
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@unique([projectId, externalId])
+  @@index([projectId])
+  @@map("participants")
+}
+
+/// Raw score entries linking a participant to a specific criterion
+model ParticipantScore {
+  id            String          @id @default(uuid())
+  participantId String
+  participant   Participant     @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  
+  criteriaId    String
+  criteria      RankingCriteria @relation(fields: [criteriaId], references: [id], onDelete: Cascade)
+  
+  rawValue      Float           // Raw entered value before normalization
+
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  @@unique([participantId, criteriaId])
+  @@index([participantId])
+  @@index([criteriaId])
+  @@map("participant_scores")
+}
+
+/// Calculated, immutable ranking results per evaluation period
+model RankingResult {
+  id             String        @id @default(uuid())
+  periodId       String
+  period         RankingPeriod @relation(fields: [periodId], references: [id], onDelete: Cascade)
+  
+  participantId  String
+  participant    Participant   @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  
+  compositeScore Float         // Computed final score (scaled 0 - 100)
+  rank           Int           // Position on leaderboard (1-based)
+  breakdownJson  Json          // Breakdown payload storing normalized & weighted values per criterion code
+
+  calculatedAt   DateTime      @default(now())
+
+  @@unique([periodId, participantId])
+  @@index([periodId, rank])
+  @@index([participantId])
+  @@map("ranking_results")
+}
+
+/// Audit log tracking uploaded Excel files and processing error reports
+model DataImport {
+  id          String         @id @default(uuid())
+  projectId   String
+  project     RankingProject @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  
+  fileName    String
+  status      ImportStatus   @default(PENDING)
+  totalRows   Int            @default(0)
+  errorLog    Json?          // Array storing line-by-line validation issues
+
+  importedAt  DateTime       @default(now())
+
+  @@index([projectId])
+  @@map("data_imports")
+}
